@@ -25,6 +25,8 @@ const { sendDeadlineReminders } = require('./services/deadlineReminderService');
 const { publishDueCampaignUpdates } = require('./services/campaignUpdatesPublishing');
 const { processDuePayoutSchedules } = require('./services/payoutScheduleService');
 const { processAutoReleases } = require('./services/milestoneAutoRelease');
+const { runAllPurges } = require('./services/retentionPurge');
+const { runRestoreVerification } = require('./services/restoreVerification');
 
 let intervals = [];
 let isShuttingDown = false;
@@ -177,6 +179,22 @@ async function startBackgroundWorkers() {
     () => processAutoReleases(),
     60 * 1000,
     'milestone-auto-release-cron'
+  );
+
+  // Retention purge: daily at midnight
+  startInterval(
+    'retention-purge-cron',
+    () => runAllPurges(),
+    24 * 60 * 60 * 1000,
+    'retention-purge-cron'
+  );
+
+  // Scheduled restore verification: weekly
+  startInterval(
+    'restore-verification-cron',
+    () => runRestoreVerification(),
+    7 * 24 * 60 * 60 * 1000,
+    'restore-verification-cron'
   );
 }
 

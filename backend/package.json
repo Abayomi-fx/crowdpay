@@ -1,11 +1,11 @@
 {
   "name": "crowdpay-backend",
   "version": "1.0.0",
-  "description": "CrowdPay backend — campaign logic, Stellar wallet management, Horizon listener",
+  "description": "CrowdPay backend \u2014 campaign logic, Stellar wallet management, Horizon listener",
   "main": "src/index.js",
   "scripts": {
-    "dev": "nodemon src/index.js",
-    "start": "node src/index.js",
+    "dev": "node init && nodemon src/index.js",
+    "start": "node init && node src/index.js",
     "lint": "eslint src/ db/ scripts/",
     "lint:fix": "eslint src/ db/ scripts/ --fix",
     "format": "prettier --write src/ db/ scripts/",

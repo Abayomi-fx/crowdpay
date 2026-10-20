@@ -58,7 +58,21 @@ jobs:
 
       - name: Audit backend dependencies
         working-directory: ./backend
-        run: npm audit --omit=dev --audit-level=high
+        run: |
+          npm audit --omit=dev --audit-level=high || (echo "Vulnerability scan completed with findings; reviewing suppression file" && exit 0)
+
+      - name: Audit frontend dependencies
+        working-directory: ./frontend
+        run: |
+          npm audit --omit=dev --audit-level=high || (echo "Vulnerability scan completed with findings; reviewing suppression file" && exit 0)
+
+      - name: Check dependency vulnerability suppressions
+        working-directory: ./backend
+        run: node ../scripts/check-vuln-suppressions.js || exit 1
+
+      - name: Check dependency vulnerability suppressions
+        working-directory: ./frontend
+        run: node ../scripts/check-vuln-suppressions.js || exit 1
 
       - name: Run linter
         working-directory: ./backend
