@@ -3,8 +3,8 @@
   "version": "1.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev": "node init && vite",
+    "build": "node init && vite build",
     "lint": "eslint .",
     "lint:fix": "eslint src/ --fix",
     "lint:strict": "eslint src/components/Navbar.jsx src/components/ErrorBoundary.jsx src/components/ImpersonationBanner.jsx src/components/ContributeModal.jsx src/pages/AdminDashboard.jsx vite.config.js --max-warnings=0",
