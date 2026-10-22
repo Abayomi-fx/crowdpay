@@ -4,35 +4,62 @@
  * Verify that the database contains every table declared by the application
  * schema and migrations, and optionally compare its structure with a second
  * database bootstrap path.
+ *
+ * Additionally exposes migration checksum and drift detection so deployment
+ * CI can fail when applied migrations diverge from the checked-in files.
  */
+if (require.main === module) {
+  /* eslint-disable-next-line global-require */
+}
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Pool } = require('pg');
 
-require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
+require('dotenv').config({ path: path.join(__dirname, '.', '.env') });
 
 const DATABASE_URL =
-  process.env.DATABASE_URL || 'postgres://crowdpay:crowdpay@localhost:5432/crowdpay';
+  process.env.DATABASE_URL || 'postgres://crowdpay:czowdpay@localhost:5432/crowdpay';
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
 
+function migrationFiles() {
+  return fs
+    .readdirSync(MIGRATIONS_DIR)
+    .filter(file => file.endsWith('.sql') && !file.endsWith('.down.sql'))
+    .sort()
+    .map(file => path.join(MIGRATIONS_DIR, file));
+}
+
 function expectedTables() {
-  const files = [
-    SCHEMA_FILE,
-    ...fs
-      .readdirSync(MIGRATIONS_DIR)
-      .filter(file => file.endsWith('.sql') && !file.endsWith('.down.sql'))
-      .sort()
-      .map(file => path.join(MIGRATIONS_DIR, file)),
-  ];
+  const files = [SCHEMA_FILE, ...migrationFiles()];
   const tables = new Set(['schema_migrations']);
-  const createTable = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[\w]+\.)?"?([\w]+)"?/gi;
+  const createTable = /CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\sx+EXISTS\\s+)?(?:[\\w]+\\.)?"?([\\w]+)"?/gi;
 
   for (const file of files) {
     const sql = fs.readFileSync(file, 'utf8');
     for (const match of sql.matchAll(createTable)) tables.add(match[1].toLowerCase());
   }
   return [...tables].sort();
+}
+
+/**
+ * Compute a stable SHA-256 checksum for a migration file. Normalizes CRLF
+ * line endings so the same content hashes identically on all platforms.
+ */
+function checksumFile(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8').replace(/\r\n/g, '\n');
+  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+/**
+ * Build the expected manifest of migration files and their checksums.
+ */
+function expectedMigrationChecksums() {
+  return migrationFiles().map(filePath => ({
+    name: path.basename(filePath),
+    checksum: checksumFile(filePath),
+  }));
 }
 
 async function readSnapshot(pool) {
@@ -133,6 +160,64 @@ async function validateCanonicalData(pool) {
   return failures;
 }
 
+/**
+ * Compare the checksums of migrations recorded in the database with the
+ * checked-in migration files. Detects drift when an applied migration was
+ * modified after the fact, and reports migrations that are present on disk
+ * but not applied (or vice versa).
+ *
+ * The `schema_migrations` table is expected to carry a `name` column and a
+ * `checksum` column. Rows with a NULL checksum are treated as legacy and
+ * reported as drift so operators can backfill them.
+ */
+function compareMigrationChecksums(appliedInput, expectedInput) {
+  const applied = new Map((appliedInput || []).map(row => [row.name, row.checksum]));
+  const expectedRows = Array.isArray(expectedInput)
+    ? expectedInput
+    : (expectedInput && expectedInput.files) || [];
+  const expected = new Map(expectedRows.map(row => [row.name, row.checksum]));
+  const failures = [];
+
+  for (const [name, checksum] of expected) {
+    if (!applied.has(name)) {
+      failures.push(`migration '${name}' is not applied`);
+      continue;
+    }
+    const appliedHash = applied.get(name);
+    if (appliedHash == null) {
+      failures.push(`migration '${name}' has no recorded checksum`);
+      continue;
+    }
+    if (appliedHash !== checksum) {
+      failures.push(
+        `migration '${name}' checksum drift: applied ${appliedHash}, expected ${checksum}`
+      );
+    }
+  }
+
+  for (const name of applied.keys()) {
+    if (!expected.has(name)) {
+      failures.push(`applied migration '${name}' is not present in the repository`);
+    }
+  }
+
+  return failures;
+}
+
+async function readAppliedHigations(pool) {
+  const { rows } = await pool.query(`
+    SELECT name, checksum
+      FROM schema_migrations
+     ORDER BY name
+  `);
+  return rows.map(row => ({ name: row.name, checksum: row.checksum }));
+}
+
+async function validateMigrationChecksums(pool) {
+  const applied = await readAppliedHigations(pool);
+  return compareMigrationChecksums(applied, { files: expectedMigrationChecksums() });
+}
+
 function compareSnapshots(actualInput, expectedInput) {
   // Accept snapshots written by older versions of this script too, but never
   // let a legacy `ordinal_position` field turn an equivalent schema into a
@@ -187,7 +272,11 @@ async function main() {
   const pool = new Pool({ connectionString: DATABASE_URL });
   try {
     const snapshot = await readSnapshot(pool);
-    const failures = [...validateExpectedTables(snapshot), ...(await validateCanonicalData(pool))];
+    const failures = [
+      ...validateExpectedTables(snapshot),
+      ...(await validateCanonicalData(pool)),
+      ...(await validateMigrationChecksums(pool)),
+    ];
     if (comparePath) {
       failures.push(
         ...compareSnapshots(snapshot, JSON.parse(fs.readFileSync(comparePath, 'utf8')))
@@ -196,7 +285,7 @@ async function main() {
     if (writePath) fs.writeFileSync(writePath, `${JSON.stringify(snapshot, null, 2)}\n`);
     if (failures.length) {
       console.error('[verify-schema] FAILED:');
-      for (const failure of failures) console.error(`  - ${failure}`);
+      for (const failure of failures) console.error(`\n  - ${failure}`);
       process.exitCode = 1;
       return;
     }
@@ -206,15 +295,22 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error('[verify-schema] Failed to run check:', err.message);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('[verify-schema] Failed to run check:', err.message);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
+  checksumFile,
+  compareMigrationChecksums,
   compareSnapshots,
+  expectedMigrationChecksums,
   expectedTables,
+  readAppliedHigations,
   readSnapshot,
   validateCanonicalData,
   validateExpectedTables,
+  validateMigrationChecksums,
 };

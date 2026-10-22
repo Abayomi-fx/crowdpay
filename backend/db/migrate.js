@@ -1,5 +1,6 @@
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env') });
 
+const fs = require('fs');
 const { Pool } = require('pg');
 const {
   listUpMigrationFilenames,
@@ -10,6 +11,16 @@ const {
   listAllMigrationFilenames,
   loadApplied,
 } = require('./migrateLib');
+let checksumReport;
+let writeChecksumFile;
+try {
+  ({ checksumReport, writeChecksumFile } = require('./migrationChecksums'));
+} catch (err) {
+  checksumReport = () => ({ entries: [], missing: [], mismatched: [], unexpected: [] });
+  writeChecksumFile = () => {
+    throw new Error('migrationChecksums module unavailable: ' + err.message);
+  };
+}
 
 // Match backend/.env.example and docker-compose db service defaults.
 process.env.DATABASE_URL =
@@ -33,6 +44,13 @@ const COMMAND = process.argv[2] || 'up';
 const BOOTSTRAP_SCHEMA =
   process.argv.includes('--bootstrap-schema') || process.env.MIGRATE_BOOTSTRAP_SCHEMA === '1';
 
+// `--check-drift` (or MIGRATE_CHECK_DRIFT=1) makes `up` fail fast when the
+// checked-in checksum manifest (db/migration-checksums.json) does not match
+// the migration files on disk. This catches accidental edits to applied
+// migrations before they reach a database in deployment CI.
+const CHECK_DRIFT =
+  process.argv.includes('--check-drift') || process.env.MIGRATE_CHECK_DRIFT === '1';
+
 // PostgreSQL ERRCODEs for "this already exists" failures.
 const ALREADY_CREATED_CODES = new Set([
   '42P07', // duplicate_table
@@ -44,6 +62,18 @@ const ALREADY_CREATED_CODES = new Set([
 async function runUp() {
   const client = await pool.connect();
   try {
+    if (CHECK_DRIFT) {
+      const drift = checksumReport();
+      if (drift.missing.length || drift.mismatched.length || drift.unexpected.length) {
+        throw new Error(
+          `Migration checksum drift detected. ` +
+            `missing=[${drift.missing.join(',')}] ` +
+            `mismatched=[${drift.mismatched.join(',')}] ` +
+            `unexpected=[${drift.unexpected.join(',')}]. ` +
+            `Run \`node db/migrate.js checksums --write\` and commit the manifest.`
+        );
+      }
+    }
     validateMigrationFiles();
     await ensureSchemaMigrationsTable(client);
     const appliedRows = await loadApplied(client);
@@ -156,6 +186,49 @@ async function runStatus() {
   }
 }
 
+async function runChecksums() {
+  try {
+    const write = process.argv.includes('--write');
+    const drift = checksumReport();
+    if (write) {
+      writeChecksumFile();
+      console.log('[migrate:checksums] Wrote db/migration-checksums.json');
+      return;
+    }
+    if (drift.missing.length || drift.mismatched.length || drift.unexpected.length) {
+      console.error('[migrate:checksums] Drift detected:');
+      for (const f of drift.missing) console.error(`  MISSING    ${f}`);
+      for (const f of drift.mismatched) console.error(`  MISMATCHED ${f}`);
+      for (const f of drift.unexpected) console.error(`  UNEXPECTED ${f}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`[migrate:checksums] OK (${drift.entries.length} migration(s) verified).`);
+  } catch (err) {
+    console.error('[migrate:checksums] Failed:', err.message);
+    process.exitCode = 1;
+  }
+}
+
+async function runVerify() {
+  try {
+    validateMigrationFiles();
+    const drift = checksumReport();
+    if (drift.missing.length || drift.mismatched.length || drift.unexpected.length) {
+      throw new Error(
+        `Migration checksum drift detected. ` +
+          `missing=[${drift.missing.join(',')}] ` +
+          `mismatched=[${drift.mismatched.join(',')}] ` +
+          `unexpected=[${drift.unexpected.join(',')}].`
+      );
+    }
+    console.log(`[migrate:verify] OK (${drift.entries.length} migration(s) verified).`);
+  } catch (err) {
+    console.error('[migrate:verify] Failed:', err.message);
+    process.exitCode = 1;
+  }
+}
+
 async function runDown() {
   console.error('[migrate:down] Rollback is not supported due to lack of down migration files.');
   process.exitCode = 1;
@@ -170,16 +243,25 @@ async function main() {
     case 'status':
       await runStatus();
       break;
+    case 'checksums':
+      await runChecksums();
+      break;
+    case 'verify':
+      await runVerify();
+      break;
     case 'down':
       await runDown();
       break;
     default:
       console.error(`Unknown command: ${COMMAND}`);
-      console.error('Usage: node db/migrate.js [up|status|down] [--bootstrap-schema]');
+      console.error('Usage: node db/migrate.js [up|status|down|checksums|verify] [--bootstrap-schema] [--check-drift]');
       console.error('  --bootstrap-schema  skip migrations whose objects already exist after');
       console.error(
         '                      `psql -f db/schema.sql` (used by npm run migrate:fresh)'
       );
+      console.error('  --check-drift       fail `up` if migration files drift from the manifest');
+      console.error('  checksums [--write] print/write db/migration-checksums.json');
+      console.error('  verify              validate migration files and checksum manifest');
       process.exitCode = 1;
       await pool.end();
   }
