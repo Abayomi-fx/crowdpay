@@ -11,7 +11,8 @@ const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
 const { Pool } = require('pg');
-const { listUpMigrationFilenames } = require('./migrateLib');
+const { listUpMigrationFilenames, computeChecksum } = require('./migrateLib');
+
 
 const execFileAsync = promisify(execFile);
 const fixturePath = path.join(__dirname, 'fixtures', 'production-like-20260404.sql');
@@ -58,12 +59,36 @@ async function main() {
     }
 
     const { rows: migrationRows } = await targetPool.query(
-      'SELECT filename FROM schema_migrations ORDER BY filename'
+      'SELECT filename, checksum FROM schema_migrations ORDER BY filename'
     );
-    if (migrationRows.length !== listUpMigrationFilenames().length) {
+    const expectedFilenames = listUpMigrationFilenames();
+    if (migrationRows.length !== expectedFilenames.length) {
       throw new Error(
-        `Migration runner did not apply the complete set: ${migrationRows.length}/${listUpMigrationFilenames().length}`
+        `Migration runner did not apply the complete set: ${migrationRows.length}/${expectedFilenames.length}`
       );
+    }
+
+    // Drift detection: every applied migration must match the committed file
+    // byte-for-byte, and no applied migration may be missing from the repo.
+    const appliedByName = new Map(migrationRows.map(row => [row.filename, row.checksum]));
+    for (const filename of expectedFilenames) {
+      if (!appliedByName.has(filename)) {
+        throw new Error(`Applied migration set is missing committed file: ${filename}`);
+      }
+      const expectedChecksum = computeChecksum(
+        fs.readFileSync(path.join(__dirname, 'migrations', filename), 'utf8')
+      );
+      const appliedChecksum = appliedByName.get(filename);
+      if (appliedChecksum !== expectedChecksum) {
+        throw new Error(
+          `Migration drift detected for ${filename}: applied=${appliedChecksum} expected=${expectedChecksum}`
+        );
+      }
+    }
+    for (const filename of appliedByName.keys()) {
+      if (!expectedFilenames.includes(filename)) {
+        throw new Error(`Applied migration has no committed file: ${filename}`);
+      }
     }
 
     const { rows: indexes } = await targetPool.query(`

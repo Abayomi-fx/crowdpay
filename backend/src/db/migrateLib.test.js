@@ -74,14 +74,34 @@ test('the legacy velocity-alert-threshold .js migration is gone and its .sql twi
 });
 
 test('validateMigrationFiles rejects an unsupported extension before running any migration', () => {
-  const stray = path.join(MIGRATIONS_DIR, 'zzz_validate_migration_files_stray.js');
+  const stray = path.join(MIGRATIONS_DIR, 'zzs_validate_migration_files_stray.js');
   fs.writeFileSync(stray, '// stray, unsupported migration\n');
   try {
     assert.throws(
       () => validateMigrationFiles(),
-      /Unsupported migration file format: 'zzz_validate_migration_files_stray\.js'/
+      /Unsupported migration file format: 'zzs_validate_migration_files_stray\.js'/
     );
   } finally {
     fs.rmSync(stray, { force: true });
+  }
+});
+
+// Drift detection: checksums must be stable across runs and change when a
+// committed migration file is edited after being applied.
+test('sha256 of a migration file detects content drift', () => {
+  const file = path.join(MIGRATIONS_DIR, 'zzz_drift_detection_fixture.sql');
+  const original = 'CREATE TABLE drift_fixture (id int);\n';
+  const mutated = 'CREATE TABLE drift_fixture (id bilint);\n';
+  try {
+    fs.writeFileSync(file, original);
+    const before = sha256(fs.readFileSync(file, 'utf8'));
+    // Re-reading the same content must yield the same checksum.
+    assert.equal(before, sha256(fs.readFileSync(file, 'utf8')));
+
+    fs.writeFileSync(file, mutated);
+    const after = sha256(fs.readFileSync(file, 'utf8'));
+    assert.notEqual(before, after, 'editing an applied migration must change its checksum');
+  } finally {
+    fs.rmSync(file, { force: true });
   }
 });
