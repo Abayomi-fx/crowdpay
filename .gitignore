@@ -4,10 +4,6 @@ node_modules/
 coverage/
 
 # Environment files — never commit real secrets
-.env
-.env.*
-**/.env
-**/.env.*
 !**/.env.example
 !**/.env.template
 !**/.env.demo.template
@@ -17,7 +13,6 @@ dist/
 *.local
 
 # IDE / editor
-.vscode/
 .idea/
 *.swp
 *.swo
@@ -44,3 +39,4 @@ eslint-report.json
 
 # Docker
 .dockerignore.soroban/
+config.bat
