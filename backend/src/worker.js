@@ -31,6 +31,34 @@ const { runRestoreVerification } = require('./services/restoreVerification');
 let intervals = [];
 let isShuttingDown = false;
 
+const SCHEDULED_PROCESSOR_FLAGS = [
+  'campaign-status-cron',
+  'reconciliation-cron',
+  'scheduled-publish-cron',
+  'contract-deployment-retry-cron',
+  'weekly-digest-cron',
+  'deadline-reminder-cron',
+  'scheduled-campaign-updates-cron',
+  'recurring-payout-schedules-cron',
+  'milestone-auto-release-cron',
+  'retention-purge-cron',
+  'restore-verification-cron',
+];
+
+function hasEnabledProcessor() {
+  const directProcessors = [
+    'ENABLE_LEDGER_MONITOR',
+    'ENABLE_WEBHOOK_POLLER',
+    'ENABLE_RECURRING_CONTRIBUTIONS_WORKER',
+    'ENABLE_SUBSCRIPTION_CLAIM_WORKER',
+    'ENABLE_HEALTH_COLLECTOR',
+  ];
+  return (
+    directProcessors.some(name => process.env[name] !== 'false') ||
+    SCHEDULED_PROCESSOR_FLAGS.some(flag => featureFlags.isEnabled(flag))
+  );
+}
+
 async function runScheduledPublishing() {
   if (isShuttingDown) return;
   try {
@@ -81,6 +109,10 @@ async function startBackgroundWorkers() {
     return;
   }
 
+  if (!hasEnabledProcessor()) {
+    throw new Error('All background processors are disabled');
+  }
+
   isShuttingDown = false;
   logger.info('worker: bootstrapping background lifecycle');
 
@@ -99,8 +131,12 @@ async function startBackgroundWorkers() {
   }
 
   // Recurring Contributions & Subscriptions
-  startRecurringContributionsCron();
-  startSubscriptionClaimWorker();
+  if (process.env.ENABLE_RECURRING_CONTRIBUTIONS_WORKER !== 'false') {
+    startRecurringContributionsCron();
+  }
+  if (process.env.ENABLE_SUBSCRIPTION_CLAIM_WORKER !== 'false') {
+    startSubscriptionClaimWorker();
+  }
 
   // Health collector
   if (process.env.ENABLE_HEALTH_COLLECTOR !== 'false') {
