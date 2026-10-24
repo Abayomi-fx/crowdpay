@@ -60,6 +60,54 @@ function readDownSql(upFile) {
   return fs.readFileSync(p, 'utf8');
 }
 
+/**
+ * Compares the checksum recorded for each applied migration against the
+ * current on-disk file. Returns a list of drift entries; an empty array means
+ * no drift. Rows applied before hash tracking (file_hash NULL) are reported
+ * as 'unrecorded' rather than mismatched, so they do not fail CI by default.
+ *
+ * Each entry: { filename, type: 'mismatch' | 'missing' | 'unrecorded', expected, actual }
+ */
+function detectMigrationDrift(appliedRows) {
+  const drift = [];
+  const onDisk = new Set(listUpMigrationFilenames());
+
+  for (const row of appliedRows) {
+    const { filename, file_hash: expected } = row;
+    if (!onDisk.has(filename)) {
+      drift.push({ filename, type: 'missing', expected: expected || null, actual: null });
+      continue;
+    }
+    if (!expected) {
+      drift.push({ filename, type: 'unrecorded', expected: null, actual: fileHashFor(filename) });
+      continue;
+    }
+    const actual = fileHashFor(filename);
+    if (actual !== expected) {
+      drift.push({ filename, type: 'mismatch', expected, actual });
+    }
+  }
+  return drift;
+}
+
+/**
+ * Throws if any applied migration has been modified or removed since it was
+ * applied. Unrecorded hashes are tolerated unless `strict` is true.
+ */
+function assertNoMigrationDrift(appliedRows, { strict = false } = {}) {
+  const drift = detectMigrationDrift(appliedRows);
+  const failing = drift.filter(d => d.type !== 'unrecorded' || strict);
+  if (failing.length > 0) {
+    const lines = failing.map(d => {
+      if (d.type === 'missing') return `  - ${d.filename}: applied but missing from disk`;
+      if (d.type === 'unrecorded') return `  - ${d.filename}: no recorded checksum (strict mode)`;
+      return `  - ${d.filename}: checksum changed (expected ${d.expected}, actual ${d.actual})`;
+    });
+    throw new Error(`Migration drift detected:\n${lines.join('\n')}`);
+  }
+  return drift;
+}
+
 async function ensureSchemaMigrationsTable(client) {
   await client.query(`
     CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -108,4 +156,6 @@ module.exports = {
   listAllMigrationFilenames,
   validateMigrationFiles,
   loadApplied,
-};
+  detectMigrationDrift,
+  assertNoMigrationDrift,
+}
