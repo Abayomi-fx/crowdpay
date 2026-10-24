@@ -161,10 +161,14 @@ async function runStatus() {
     const pending = rows.filter(r => r.status === 'PENDING').length;
     const applied = rows.filter(r => r.status.startsWith('APPLIED')).length;
     const unsupported = rows.filter(r => r.status === 'UNSUPPORTED FORMAT').length;
+    const drifted = rows.filter(r => r.status === 'APPLIED (HASH MISMATCH)').length;
     console.log('-----------------');
     console.log(
-      `${applied} applied, ${pending} pending, ${unsupported} unsupported (${rows.length} total).`
+      `${applied} applied, ${pending} pending, ${unsupported} unsupported, ${drifted} drifted (${rows.length} total).`
     );
+    if (drifted > 0) {
+      process.exitCode = 1;
+    }
   } catch (err) {
     console.error('[migrate:status] Failed:', err.message);
     process.exitCode = 1;
