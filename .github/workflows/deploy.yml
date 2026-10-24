@@ -38,6 +38,28 @@ jobs:
 
             git fetch origin main
 
+            # Migration drift detection: checksum all migration files and compare
+            # against the manifest recorded by the last successful deploy. A changed
+            # checksum for an already-applied migration indicates drift (edited history).
+            MIGRATIONS_DIR="backend/db/migrations"
+            CHECKSUM_FILE=".migration-checksums"
+            if [ -d "$MIGRATIONS_DIR" ]; then
+              CURRENT_CHECKSUMS=$(find "$MIGRATIONS_DIR" -type f -name '*.sql' -print0 | sort -z | xargs -0 sha256sum)
+            else
+              CURRENT_CHECKSUMS=""
+            fi
+            if [ -f "$CHECKSUM_FILE" ] && [ -n "$CURRENT_CHECKSUMS" ]; then
+              while read -r recorded_sum recorded_file; do
+                current_sum=$(printf '%s\n' "$CURRENT_CHECKSUMS" | awk -v f="$recorded_file" '$2==f {print $1}')
+                if [ -n "$current_sum" ] && [ "$current_sum" != "$recorded_sum" ]; then
+                  echo "ERROR: Migration drift detected — $recorded_file changed since it was applied."
+                  echo "Expected $recorded_sum, found $current_sum. Aborting deploy."
+                  exit 1
+                fi
+              done < "$CHECKSUM_FILE"
+            fi
+
+
             # --ff-only refuses to proceed if the local branch has diverged
             # (e.g. a force-push landed or a local commit exists), failing
             # explicitly instead of silently overwriting local state.
@@ -71,6 +93,12 @@ jobs:
 
             docker compose -f docker-compose.prod.yml up -d --build
             docker compose -f docker-compose.prod.yml exec -T backend node db/migrate.js
+
+            # Persist checksums only after migrations succeed, so the manifest
+            # reflects migrations that were actually applied.
+            if [ -n "$CURRENT_CHECKSUMS" ]; then
+              printf '%s\n' "$CURRENT_CHECKSUMS" > "$CHECKSUM_FILE"
+            fi
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           JWT_SECRET: ${{ secrets.JWT_SECRET }}

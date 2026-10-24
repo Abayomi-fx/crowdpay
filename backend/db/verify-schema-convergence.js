@@ -4,7 +4,14 @@
  * Verify that the database contains every table declared by the application
  * schema and migrations, and optionally compare its structure with a second
  * database bootstrap path.
+ *
+ * Drift detection: every migration file (and schema.sql) is hashed with
+ * SHA-256. The resulting checksum manifest can be written with
+ * --write-checksums and compared in CI with --check-checksums so that any
+ * edit to an already-shipped migration is reported as drift, not silently
+ * accepted.
  */
+const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
@@ -15,9 +22,10 @@ const DATABASE_URL =
   process.env.DATABASE_URL || 'postgres://crowdpay:crowdpay@localhost:5432/crowdpay';
 const SCHEMA_FILE = path.join(__dirname, 'schema.sql');
 const MIGRATIONS_DIR = path.join(__dirname, 'migrations');
+const CHECKSUMS_FILE = path.join(__dirname, 'migration-checksums.json');
 
-function expectedTables() {
-  const files = [
+function migrationFiles() {
+  return [
     SCHEMA_FILE,
     ...fs
       .readdirSync(MIGRATIONS_DIR)
@@ -25,14 +33,64 @@ function expectedTables() {
       .sort()
       .map(file => path.join(MIGRATIONS_DIR, file)),
   ];
+}
+
+function expectedTables() {
   const tables = new Set(['schema_migrations']);
   const createTable = /CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[\w]+\.)?"?([\w]+)"?/gi;
 
-  for (const file of files) {
+  for (const file of migrationFiles()) {
     const sql = fs.readFileSync(file, 'utf8');
     for (const match of sql.matchAll(createTable)) tables.add(match[1].toLowerCase());
   }
   return [...tables].sort();
+}
+
+/**
+ * Compute SHA-256 checksums for every schema/migration file, keyed by path
+ * relative to the db directory so the manifest is portable across machines.
+ */
+function computeChecksums() {
+  const checksums = {};
+  for (const file of migrationFiles()) {
+    const key = path.relative(__dirname, file).split(path.sep).join('/');
+    const hash = crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    checksums[key] = hash;
+  }
+  return checksums;
+}
+
+/**
+ * Compare current checksums against a stored manifest. Returns a list of
+ * failures: modified files, files missing from the manifest (new migrations
+ * that were not recorded), and files recorded but no longer present.
+ */
+function compareChecksums(current, recorded) {
+  const failures = [];
+  for (const [file, hash] of Object.entries(recorded)) {
+    if (!(file in current)) {
+      failures.push(`migration '${file}' was recorded but no longer exists`);
+    } else if (current[file] !== hash) {
+      failures.push(`migration '${file}' has drifted: checksum changed after being recorded`);
+    }
+  }
+  for (const file of Object.keys(current)) {
+    if (!(file in recorded)) {
+      failures.push(`migration '${file}' has no recorded checksum (run --write-checksums)`);
+    }
+  }
+  return failures;
+}
+
+function readChecksumManifest(file = CHECKSUMS_FILE) {
+  if (!fs.existsSync(file)) {
+    throw new Error(`checksum manifest not found at ${file}; run --write-checksums first`);
+  }
+  const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(`checksum manifest at ${file} is malformed`);
+  }
+  return parsed;
 }
 
 async function readSnapshot(pool) {
@@ -174,14 +232,40 @@ function compareSnapshots(actualInput, expectedInput) {
 
 async function main() {
   const args = process.argv.slice(2);
-  const writeIndex = args.indexOf('--write-snapshot');
-  const compareIndex = args.indexOf('--compare-snapshot');
-  const writePath = writeIndex >= 0 ? args[writeIndex + 1] : null;
-  const comparePath = compareIndex >= 0 ? args[compareIndex + 1] : null;
-  if ((writeIndex >= 0 && !writePath) || (compareIndex >= 0 && !comparePath)) {
-    throw new Error(
-      'Usage: node db/verify-schema-convergence.js [--write-snapshot path | --compare-snapshot path]'
+  const flagValue = name => {
+    const index = args.indexOf(name);
+    if (index < 0) return undefined;
+    const value = args[index + 1];
+    if (!value || value.startsWith('--')) {
+      throw new Error(`Option ${name} requires a file path`);
+    }
+    return value;
+  };
+  const writePath = flagValue('--write-snapshot');
+  const comparePath = flagValue('--compare-snapshot');
+  const writeChecksums = args.includes('--write-checksums');
+  const checkChecksums = args.includes('--check-checksums');
+  const checksumsPath = flagValue('--checksums-file') || CHECKSUMS_FILE;
+
+  if (writeChecksums) {
+    const checksums = computeChecksums();
+    fs.writeFileSync(checksumsPath, `${JSON.stringify(checksums, null, 2)}\n`);
+    console.log(
+      `[verify-schema] Wrote ${Object.keys(checksums).length} migration checksums to ${checksumsPath}.`
     );
+    return;
+  }
+
+  if (checkChecksums) {
+    const failures = compareChecksums(computeChecksums(), readChecksumManifest(checksumsPath));
+    if (failures.length) {
+      console.error('[verify-schema] Migration drift detected:');
+      for (const failure of failures) console.error(`  - ${failure}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log('[verify-schema] Migration checksums match the recorded manifest.');
+    return;
   }
 
   const pool = new Pool({ connectionString: DATABASE_URL });
@@ -206,14 +290,19 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error('[verify-schema] Failed to run check:', err.message);
-  process.exitCode = 1;
-});
+if (require.main === module) {
+  main().catch(err => {
+    console.error('[verify-schema] Failed to run check:', err.message);
+    process.exitCode = 1;
+  });
+}
 
 module.exports = {
+  compareChecksums,
   compareSnapshots,
+  computeChecksums,
   expectedTables,
+  readChecksumManifest,
   readSnapshot,
   validateCanonicalData,
   validateExpectedTables,
